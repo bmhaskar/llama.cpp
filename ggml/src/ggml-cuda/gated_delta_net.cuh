@@ -20,3 +20,11 @@ bool ggml_cuda_should_use_chunked_gdn(const ggml_tensor * dst);
 // Shape-only part of the above, with no dependence on the current device. Used to size the chunked
 // scratch at allocation time, where the eventual execution device may not be current yet.
 bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst);
+
+// Single-kernel chunked prefill (gdn_fused.cu): the whole chunk pipeline in one fused,
+// state-resident kernel. Selected instead of the three-stage chunked path when
+// ggml_cuda_gdn_use_fused_chunked() is true; honours the same cache contract as the
+// three-stage entry (cache != nullptr redirects the final-state write to cache->data).
+void ggml_cuda_op_gated_delta_net_chunked_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                                const ggml_cuda_gated_delta_net_fused_cache * cache);
+bool ggml_cuda_gdn_use_fused_chunked(void);

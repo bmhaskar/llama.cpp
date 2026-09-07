@@ -348,6 +348,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // (cache->data). Scratch lives in dst's own allocation, so its address is stable across CUDA
     // graph capture and replay.
     if (ggml_cuda_should_use_chunked_gdn(dst)) {
+        if (ggml_cuda_gdn_use_fused_chunked()) {
+            ggml_cuda_op_gated_delta_net_chunked_fused(ctx, dst, cache);
+            return;
+        }
         ggml_cuda_op_gated_delta_net_chunked(ctx, dst, cache);
         return;
     }
