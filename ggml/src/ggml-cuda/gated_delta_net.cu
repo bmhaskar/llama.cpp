@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "gdn-chunked.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -292,6 +293,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    // Chunked prefill path (scalar gate only). Falls through when not eligible.
+    if (!kda && ggml_cuda_gdn_chunked_try(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K)) {
+        return;
     }
 
     if (kda) {
