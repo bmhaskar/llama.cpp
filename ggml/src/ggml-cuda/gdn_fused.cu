@@ -575,8 +575,13 @@ bool ggml_cuda_gdn_use_fused_chunked(void) {
 #endif // GGML_CUDA_NO_GDN_FUSED
 }
 
+// n_bulk > 0 runs only the first n_bulk tokens and writes the carried state to
+// bulk_state_out instead of the usual destination. Used by the K>1 split in
+// gated_delta_net.cu: the caller finishes the tail with the recurrent kernel,
+// which is the only path that emits the rollback snapshots.
 void ggml_cuda_op_gated_delta_net_chunked_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                                                const ggml_cuda_gated_delta_net_fused_cache * cache) {
+                                                const ggml_cuda_gated_delta_net_fused_cache * cache,
+                                                int n_bulk, float * bulk_state_out) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_k     = dst->src[1];
     const ggml_tensor * src_v     = dst->src[2];
@@ -586,7 +591,8 @@ void ggml_cuda_op_gated_delta_net_chunked_fused(ggml_backend_cuda_context & ctx,
 
     const int V_dim = (int) src_v->ne[0];
     const int H     = (int) src_v->ne[1];
-    const int T     = (int) src_v->ne[2];
+    const int T_all = (int) src_v->ne[2];
+    const int T     = (n_bulk > 0) ? n_bulk : T_all;
     const int B     = (int) src_v->ne[3];
     const int K_dim = (int) src_q->ne[0];
     const int Hk    = (int) src_q->ne[1];
@@ -610,7 +616,14 @@ void ggml_cuda_op_gated_delta_net_chunked_fused(ggml_backend_cuda_context & ctx,
     // the cache pointer instead of the default tail of dst->data -- same contract as the
     // three-stage path. The routing predicate guarantees K == 1, so there is a single snapshot.
     float * out       = (float *) dst->data;
-    float * state_out = (cache != nullptr) ? cache->data : out + (int64_t) V_dim * H * T * B;
+    float * state_out = (cache != nullptr) ? cache->data : out + (int64_t) V_dim * H * T_all * B;
+    if (bulk_state_out != nullptr) {
+        state_out = bulk_state_out;
+    }
+
+    // The kernel derives its per-sequence offsets from T, so a shortened bulk run is
+    // only correct while there is a single sequence. The split router enforces that.
+    GGML_ASSERT(n_bulk <= 0 || B == 1);
 
     const int DTiles = V_dim / DV_TILE;   // dv slabs per head -> grid = H * DTiles blocks
     cudaStream_t stream = ctx.stream();

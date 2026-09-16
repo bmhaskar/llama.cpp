@@ -1,4 +1,7 @@
 #include "gated_delta_net.cuh"
+
+// matches the n_tokens >= 128 floor in the shape predicate below
+#define GDN_CHUNKED_MIN_TOKENS 128
 #include "chunk_gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -224,7 +227,7 @@ static void launch_gated_delta_net(
 // has to size the chunked scratch. That sizing must NOT depend on which device is current: deciding
 // from shape alone can only over-allocate on a device that ends up ineligible, never under-allocate
 // (which would corrupt memory). See ggml_cuda_gdn_get_alloc_size.
-bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
+static bool ggml_cuda_gdn_chunked_shape_eligible_impl(const ggml_tensor * dst, bool require_k1) {
     if (dst->op != GGML_OP_GATED_DELTA_NET) {
         return false;
     }
@@ -250,7 +253,7 @@ bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
     //   stride nb[2] (fused QKV view). The nb[3] check matches the chunked-entry assert: without it a
     //   view with inter-sequence padding would pass dispatch and then read the wrong batch slice.
     // - 128-wide heads, GQA-aligned head counts, n_tokens >= 128
-    return !kda && K == 1
+    return !kda && (!require_k1 || K == 1)
         && neq0 == 128 && S_v == 128 && nev1 % neq1 == 0
         && src_k->ne[1] == neq1
         && n_tokens >= 128
@@ -258,6 +261,16 @@ bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
         && src_v->nb[0] == ggml_type_size(src_v->type) && src_v->nb[1] == (size_t)S_v * ggml_type_size(src_v->type)
         && src_v->nb[3] == (size_t) n_tokens * src_v->nb[2]
         && ggml_is_contiguous(src_beta) && ggml_is_contiguous(src_state);
+}
+
+bool ggml_cuda_gdn_chunked_shape_eligible(const ggml_tensor * dst) {
+    return ggml_cuda_gdn_chunked_shape_eligible_impl(dst, /*require_k1 =*/ true);
+}
+
+// Same shape checks but without the K == 1 requirement, for the K>1 split, which
+// produces the rollback snapshots with the recurrent kernel instead.
+bool ggml_cuda_gdn_chunked_shape_eligible_ignoring_k(const ggml_tensor * dst) {
+    return ggml_cuda_gdn_chunked_shape_eligible_impl(dst, /*require_k1 =*/ false);
 }
 
 bool ggml_cuda_should_use_chunked_gdn(const ggml_tensor * dst) {
@@ -357,12 +370,42 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
-    float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
-    int64_t state_slot_stride = S_v * S_v * H * n_seqs;
+    float * state_d_pre           = dst_d + S_v * H * n_tokens * n_seqs;
+    int64_t state_slot_stride_pre = S_v * S_v * H * n_seqs;
     if (cache != nullptr) {
-        state_d           = cache->data;
-        state_slot_stride = cache->slot_stride;
+        state_d_pre           = cache->data;
+        state_slot_stride_pre = cache->slot_stride;
     }
+
+    // K > 1 split: the chunked kernels only produce state at chunk boundaries, but rollback
+    // needs a snapshot per token for the last K-1 tokens. Run the bulk on the fused chunked
+    // kernel and hand the carried state to the recurrent kernel for the final tokens, which
+    // is where every snapshot slot is written anyway. Tail >= K, so slots K-1..0 are covered.
+    if (keep_rs && !kda && n_seqs == 1 && ggml_cuda_gdn_chunked_shape_eligible_ignoring_k(dst) &&
+        ggml_cuda_gdn_use_fused_chunked()) {
+        const int64_t tail   = K;
+        const int64_t n_bulk = n_tokens - tail;
+
+        // the bulk must still clear the chunked kernel's own minimum
+        if (n_bulk >= GDN_CHUNKED_MIN_TOKENS) {
+            ggml_cuda_pool_alloc<float> bulk_state(ctx.pool(), S_v * S_v * H * n_seqs);
+
+            ggml_cuda_op_gated_delta_net_chunked_fused(ctx, dst, cache, (int) n_bulk, bulk_state.get());
+
+            // tail: same tensors, advanced by n_bulk tokens, seeded with the carried state
+            launch_gated_delta_net<false, true>(
+                q_d + n_bulk * sq2, k_d + n_bulk * sq2, v_d + n_bulk * sv2,
+                g_d + n_bulk * sb2, b_d + n_bulk * sb2,
+                bulk_state.get(),
+                dst_d + n_bulk * S_v * H, state_d_pre,
+                S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride_pre, K, stream);
+            return;
+        }
+    }
+
+    float * state_d           = state_d_pre;
+    int64_t state_slot_stride = state_slot_stride_pre;
 
     if (kda) {
         if (keep_rs) {
