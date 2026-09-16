@@ -564,6 +564,28 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.auto_fgdn = false;
     }
 
+    // Allow the fused Gated Delta Net paths to be turned off at runtime.
+    //
+    // build_delta_net() picks between build_delta_net_fused() and
+    // build_delta_net_autoregressive() / build_delta_net_chunking() based on
+    // these two flags, but both are hard-coded to true above and auto_fgdn is
+    // never set, so the non-fused paths cannot be reached in a stock build.
+    // They are useful for A/B benchmarking the fused op and as a fallback when
+    // it misbehaves on a given backend.
+    //
+    // LLAMA_FUSED_GDN_CH=0 -> chunked graph path for prompt processing
+    // LLAMA_FUSED_GDN_AR=0 -> autoregressive graph path for single tokens
+    if (const char * env = getenv("LLAMA_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = atoi(env) != 0;
+        LLAMA_LOG_INFO("%s: fused_gdn_ch = %s (LLAMA_FUSED_GDN_CH)\n",
+                func, cparams.fused_gdn_ch ? "true" : "false");
+    }
+    if (const char * env = getenv("LLAMA_FUSED_GDN_AR")) {
+        cparams.fused_gdn_ar = atoi(env) != 0;
+        LLAMA_LOG_INFO("%s: fused_gdn_ar = %s (LLAMA_FUSED_GDN_AR)\n",
+                func, cparams.fused_gdn_ar ? "true" : "false");
+    }
+
     if (cparams.auto_flid) {
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
         resolve(llm_fused_op_lid_probe, cparams.fused_lid);
