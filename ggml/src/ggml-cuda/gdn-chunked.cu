@@ -74,13 +74,13 @@
 __global__ void gdn_cumsum_kernel(
         const float * __restrict__ g, float * __restrict__ cg,
         int64_t H, int64_t n_tokens, int64_t chunk_off, int64_t chunk_len,
-        int64_t sb1, int64_t sb2, int64_t sb3) {
+        int64_t sb1, int64_t sb2, int64_t sb3, int64_t Ccap) {
     const int64_t h   = blockIdx.x;
     const int64_t seq = blockIdx.y;
     if (threadIdx.x != 0) return;
 
     float acc = 0.0f;
-    float * out = cg + (seq * H + h) * GDN_CHUNK;
+    float * out = cg + (seq * H + h) * Ccap;
     for (int64_t t = 0; t < chunk_len; t++) {
         acc += g[seq * sb3 + (chunk_off + t) * sb2 + h * sb1];
         out[t] = acc;
@@ -95,7 +95,7 @@ __global__ void gdn_expand_qk_kernel(
         const float * __restrict__ q, const float * __restrict__ k,
         float * __restrict__ q_e, float * __restrict__ k_e,
         int64_t S_v, int64_t H, int64_t chunk_off, int64_t chunk_len,
-        int64_t sq1, int64_t sq2, int64_t sq3, int64_t neqk1, int64_t rq3) {
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t neqk1, int64_t rq3, int64_t Ccap) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= chunk_len * S_v) return;
 
@@ -109,7 +109,7 @@ __global__ void gdn_expand_qk_kernel(
     const int64_t src = iq3 * sq3 + (chunk_off + t) * sq2 + iq1 * sq1 + i;
     // block stride is the FIXED chunk size: the cuBLAS batch strides below are
     // GDN_CHUNK-based, so a short final chunk must still use the full stride.
-    const int64_t dst = (seq * H + h) * GDN_CHUNK * S_v + t * S_v + i;
+    const int64_t dst = (seq * H + h) * Ccap * S_v + t * S_v + i;
 
     q_e[dst] = q[src];
     k_e[dst] = k[src];
@@ -125,7 +125,7 @@ __global__ void gdn_build_MP_kernel(
         const float * __restrict__ cg,  const float * __restrict__ beta,
         float * __restrict__ M, float * __restrict__ P,
         int64_t H, int64_t chunk_off, int64_t chunk_len,
-        int64_t sb1, int64_t sb2, int64_t sb3) {
+        int64_t sb1, int64_t sb2, int64_t sb3, int64_t Ccap) {
     const int64_t h   = blockIdx.y;
     const int64_t seq = blockIdx.z;
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -135,8 +135,8 @@ __global__ void gdn_build_MP_kernel(
     const int64_t j = idx % chunk_len;   // col
 
     const int64_t hs   = (seq * H + h);
-    const float * cg_h = cg + hs * GDN_CHUNK;
-    const int64_t base = hs * GDN_CHUNK * GDN_CHUNK;
+    const float * cg_h = cg + hs * Ccap;
+    const int64_t base = hs * Ccap * Ccap;
 
     const float beta_t = beta[seq * sb3 + (chunk_off + t) * sb2 + h * sb1];
 
@@ -160,17 +160,25 @@ __global__ void gdn_build_MP_kernel(
 __global__ void gdn_invert_M_kernel(
         float * __restrict__ M, const float * __restrict__ beta,
         int64_t H, int64_t chunk_off, int64_t chunk_len,
-        int64_t sb1, int64_t sb2, int64_t sb3) {
+        int64_t sb1, int64_t sb2, int64_t sb3, int64_t Ccap) {
     extern __shared__ float sm[];
-    float * Ms = sm;                      // chunk_len * chunk_len
-    float * Ts = sm + chunk_len * chunk_len;
+    float * Ts = sm;                      // chunk_len * chunk_len
 
     const int64_t h   = blockIdx.x;
     const int64_t seq = blockIdx.y;
-    const int64_t base = (seq * H + h) * GDN_CHUNK * GDN_CHUNK;
+    const int64_t base = (seq * H + h) * Ccap * Ccap;
 
+    // Stage M in shared when it fits (measured ~2% faster at C=64); for large C
+    // both matrices would exceed the shared limit, so read M from global instead.
+    const bool m_shared = (2 * chunk_len * chunk_len * (int64_t) sizeof(float)) <= 48 * 1024;
+    const float * Ms = m_shared ? (sm + chunk_len * chunk_len) : (M + base);
+    if (m_shared) {
+        float * dst = sm + chunk_len * chunk_len;
+        for (int64_t idx = threadIdx.x; idx < chunk_len * chunk_len; idx += blockDim.x) {
+            dst[idx] = M[base + idx];
+        }
+    }
     for (int64_t idx = threadIdx.x; idx < chunk_len * chunk_len; idx += blockDim.x) {
-        Ms[idx] = M[base + idx];
         Ts[idx] = 0.0f;
     }
     __syncthreads();
@@ -206,7 +214,7 @@ __global__ void gdn_make_rhs_kernel(
         float * __restrict__ KS, const float * __restrict__ v,
         const float * __restrict__ cg,
         int64_t S_v, int64_t H, int64_t chunk_off, int64_t chunk_len,
-        int64_t sv1, int64_t sv2, int64_t sv3) {
+        int64_t sv1, int64_t sv2, int64_t sv3, int64_t Ccap) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= chunk_len * S_v) return;
 
@@ -216,10 +224,10 @@ __global__ void gdn_make_rhs_kernel(
     const int64_t seq = blockIdx.z;
 
     const int64_t hs = (seq * H + h);
-    const float G_t  = expf(cg[hs * GDN_CHUNK + t]);
+    const float G_t  = expf(cg[hs * Ccap + t]);
     const float v_val = v[seq * sv3 + (chunk_off + t) * sv2 + h * sv1 + c];
 
-    float * dst = KS + hs * GDN_CHUNK * S_v + idx;
+    float * dst = KS + hs * Ccap * S_v + idx;
     *dst = v_val - G_t * (*dst);
 }
 
@@ -231,7 +239,7 @@ __global__ void gdn_finish_out_kernel(
         const float * __restrict__ QS, const float * __restrict__ PU,
         const float * __restrict__ cg, float * __restrict__ dst,
         int64_t S_v, int64_t H, int64_t n_tokens, int64_t chunk_off, int64_t chunk_len,
-        float scale) {
+        float scale, int64_t Ccap) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= chunk_len * S_v) return;
 
@@ -241,8 +249,8 @@ __global__ void gdn_finish_out_kernel(
     const int64_t seq = blockIdx.z;
 
     const int64_t hs = (seq * H + h);
-    const float G_t  = expf(cg[hs * GDN_CHUNK + t]);
-    const int64_t off = hs * GDN_CHUNK * S_v + idx;
+    const float G_t  = expf(cg[hs * Ccap + t]);
+    const int64_t off = hs * Ccap * S_v + idx;
 
     // dst layout matches the sequential kernel: [S_v, H, n_tokens, n_seqs]
     dst[(seq * n_tokens + chunk_off + t) * H * S_v + h * S_v + c] =
@@ -255,7 +263,7 @@ __global__ void gdn_finish_out_kernel(
 __global__ void gdn_scale_k_kernel(
         const float * __restrict__ k_e, float * __restrict__ k_s,
         const float * __restrict__ cg,
-        int64_t S_v, int64_t H, int64_t chunk_len) {
+        int64_t S_v, int64_t H, int64_t chunk_len, int64_t Ccap) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= chunk_len * S_v) return;
 
@@ -264,10 +272,10 @@ __global__ void gdn_scale_k_kernel(
     const int64_t seq = blockIdx.z;
 
     const int64_t hs = (seq * H + h);
-    const float * cg_h = cg + hs * GDN_CHUNK;
+    const float * cg_h = cg + hs * Ccap;
     const float w = expf(cg_h[chunk_len - 1] - cg_h[t]);
 
-    const int64_t off = hs * GDN_CHUNK * S_v + idx;
+    const int64_t off = hs * Ccap * S_v + idx;
     k_s[off] = w * k_e[off];
 }
 
@@ -276,7 +284,7 @@ __global__ void gdn_scale_k_kernel(
 // ---------------------------------------------------------------------------
 __global__ void gdn_decay_state_kernel(
         float * __restrict__ S, const float * __restrict__ cg,
-        int64_t S_v, int64_t H, int64_t chunk_len) {
+        int64_t S_v, int64_t H, int64_t chunk_len, int64_t Ccap) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= S_v * S_v) return;
 
@@ -284,7 +292,7 @@ __global__ void gdn_decay_state_kernel(
     const int64_t seq = blockIdx.z;
     const int64_t hs  = (seq * H + h);
 
-    S[hs * S_v * S_v + idx] *= expf(cg[hs * GDN_CHUNK + chunk_len - 1]);
+    S[hs * S_v * S_v + idx] *= expf(cg[hs * Ccap + chunk_len - 1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +317,7 @@ bool ggml_cuda_gdn_chunked_try(
     // Only the plain prefill case: long sequences, no rollback snapshots.
     // K > 1 needs per-token state snapshots for the last K-1 tokens, which the
     // chunked form does not produce; that is left to the sequential kernel.
-    if (n_tokens < 2 * GDN_CHUNK || K > 1) {
+    if (n_tokens < 128 || K > 1) {
         return false;
     }
 
@@ -327,7 +335,18 @@ bool ggml_cuda_gdn_chunked_try(
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     const int64_t HS = H * n_seqs;
-    const int64_t C  = GDN_CHUNK;
+
+    // Tunable: chunk size trades kernel-launch count (n/C) against O(C^2) work
+    // and shared memory in the triangular solve.
+    static const int64_t C = [] {
+        const char * e = getenv("GDN_CHUNK_SIZE");
+        const int64_t v = e ? atoi(e) : GDN_CHUNK;
+        return (v >= 16 && v <= 256 && (v % 16) == 0) ? v : (int64_t) GDN_CHUNK;
+    }();
+
+    // Tunable: TF32 tensor cores for the GEMMs (fp32 accumulate, ~10-bit mantissa).
+    static const cublasComputeType_t comp = getenv("GDN_TF32") && atoi(getenv("GDN_TF32"))
+        ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     const int64_t D  = S_v;
 
     ggml_cuda_pool_alloc<float> cg_buf (ctx.pool(), HS * C);
@@ -369,13 +388,13 @@ bool ggml_cuda_gdn_chunked_try(
 
         // --- per-chunk scalars and expanded q/k -----------------------------
         gdn_cumsum_kernel<<<dim3(H, n_seqs), 32, 0, stream>>>(
-            g_d, cg, H, n_tokens, off, len, sb1, sb2, sb3);
+            g_d, cg, H, n_tokens, off, len, sb1, sb2, sb3, C);
 
         {
             const int64_t work = len * D;
             dim3 grid((work + 255) / 256, H, n_seqs);
             gdn_expand_qk_kernel<<<grid, 256, 0, stream>>>(
-                q_d, k_d, q_e, k_e, D, H, off, len, sq1, sq2, sq3, neqk1, rq3);
+                q_d, k_d, q_e, k_e, D, H, off, len, sq1, sq2, sq3, neqk1, rq3, C);
         }
 
         // --- Gram matrices: KKT = K K^T, QKT = Q K^T  (row-major C x C) -----
@@ -387,7 +406,7 @@ bool ggml_cuda_gdn_chunked_try(
             k_e, CUDA_R_32F, D, C * D,
             &zero,
             KKT, CUDA_R_32F, len, C * C,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
 
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
             len, len, D,
@@ -396,18 +415,23 @@ bool ggml_cuda_gdn_chunked_try(
             q_e, CUDA_R_32F, D, C * D,
             &zero,
             QKT, CUDA_R_32F, len, C * C,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
 
         // --- M, P, then W = M^{-1} diag(beta) -------------------------------
         {
             dim3 grid((len * len + 255) / 256, H, n_seqs);
             gdn_build_MP_kernel<<<grid, 256, 0, stream>>>(
-                KKT, QKT, cg, b_d, M, P, H, off, len, sb1, sb2, sb3);
+                KKT, QKT, cg, b_d, M, P, H, off, len, sb1, sb2, sb3, C);
         }
         {
-            const size_t shmem = 2 * len * len * sizeof(float);
+            const size_t one_mat = len * len * sizeof(float);
+            const size_t shmem = (2 * one_mat <= 48 * 1024) ? 2 * one_mat : one_mat;
+            if (shmem > 48 * 1024) {
+                cudaFuncSetAttribute(gdn_invert_M_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shmem);
+            }
             gdn_invert_M_kernel<<<dim3(H, n_seqs), 256, shmem, stream>>>(
-                M, b_d, H, off, len, sb1, sb2, sb3);
+                M, b_d, H, off, len, sb1, sb2, sb3, C);
         }
 
         // --- KS = K S,  QS = Q S   (row-major C x D) ------------------------
@@ -420,7 +444,7 @@ bool ggml_cuda_gdn_chunked_try(
             k_e,     CUDA_R_32F, D, C * D,
             &zero,
             KS, CUDA_R_32F, D, C * D,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
 
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
             D, len, D,
@@ -429,13 +453,13 @@ bool ggml_cuda_gdn_chunked_try(
             q_e,     CUDA_R_32F, D, C * D,
             &zero,
             QS, CUDA_R_32F, D, C * D,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
 
         // --- rhs = V - Gamma KS, then U = W rhs -----------------------------
         {
             dim3 grid((len * D + 255) / 256, H, n_seqs);
             gdn_make_rhs_kernel<<<grid, 256, 0, stream>>>(
-                KS, v_d, cg, D, H, off, len, sv1, sv2, sv3);
+                KS, v_d, cg, D, H, off, len, sv1, sv2, sv3, C);
         }
         // row-major U(C x D) = W(C x C) rhs(C x D); column-major: U^T = rhs^T W^T
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -445,7 +469,7 @@ bool ggml_cuda_gdn_chunked_try(
             M,  CUDA_R_32F, len, C * C,
             &zero,
             U, CUDA_R_32F, D, C * D,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
 
         // --- PU = P U, then out = scale (Gamma QS + PU) ---------------------
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -455,21 +479,21 @@ bool ggml_cuda_gdn_chunked_try(
             P, CUDA_R_32F, len, C * C,
             &zero,
             PU, CUDA_R_32F, D, C * D,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
         {
             dim3 grid((len * D + 255) / 256, H, n_seqs);
             gdn_finish_out_kernel<<<grid, 256, 0, stream>>>(
-                QS, PU, cg, dst_d, D, H, n_tokens, off, len, scale);
+                QS, PU, cg, dst_d, D, H, n_tokens, off, len, scale, C);
         }
 
         // --- S = G_C S + (Gamma_C Khat)^T U ---------------------------------
         {
             dim3 grid((len * D + 255) / 256, H, n_seqs);
-            gdn_scale_k_kernel<<<grid, 256, 0, stream>>>(k_e, k_s, cg, D, H, len);
+            gdn_scale_k_kernel<<<grid, 256, 0, stream>>>(k_e, k_s, cg, D, H, len, C);
         }
         {
             dim3 grid((D * D + 255) / 256, H, n_seqs);
-            gdn_decay_state_kernel<<<grid, 256, 0, stream>>>(state_d, cg, D, H, len);
+            gdn_decay_state_kernel<<<grid, 256, 0, stream>>>(state_d, cg, D, H, len, C);
         }
         // S[i][c] += sum_t k_s[t][i] U[t][c]; column-major: S^T += U^T k_s
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
@@ -479,7 +503,7 @@ bool ggml_cuda_gdn_chunked_try(
             U,   CUDA_R_32F, D, C * D,
             &one,
             state_d, CUDA_R_32F, D, D * D,
-            HS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            HS, comp, CUBLAS_GEMM_DEFAULT));
     }
 
     CUDA_CHECK(cudaGetLastError());
