@@ -88,7 +88,7 @@ __device__ __forceinline__ void ldsm4t(const void* p, unsigned& r0, unsigned& r1
 __device__ __forceinline__ int swz(int r, int c16, int umask) { return c16 ^ (r & umask); }
 
 __global__ void __launch_bounds__(NTHREADS, MINBLOCKS)
-gdn_fused(int kT, int kHk, int kHv, int kD,
+gdn_fused(int kT, int kTstride, int kHk, int kHv, int kD,
           const float* __restrict__ qp, const float* __restrict__ kp,
           const float* __restrict__ vp, const float* __restrict__ gp,
           const float* __restrict__ bp, float* __restrict__ op,
@@ -96,7 +96,7 @@ gdn_fused(int kT, int kHk, int kHv, int kD,
           long long v_tok_stride)
 {
 #ifndef GDN_FUSED_AVAILABLE
-    GGML_UNUSED_VARS(kT, kHk, kHv, kD, qp, kp, vp, gp, bp, op, s0p, stp, v_tok_stride);
+    GGML_UNUSED_VARS(kT, kTstride, kHk, kHv, kD, qp, kp, vp, gp, bp, op, s0p, stp, v_tok_stride);
     NO_DEVICE_CODE;
 #else
     __shared__ __align__(16) __half Qs[CHUNK * DD];            // q chunk (scaled)
@@ -127,10 +127,13 @@ gdn_fused(int kT, int kHk, int kHv, int kD,
     // so the rest of the kernel is single-sequence.
     {
         const long long b = blockIdx.y;
-        qp  += b * kT * kHk * kD;   kp  += b * kT * kHk * kD;
-        vp  += b * kT * v_tok_stride;
-        gp  += b * kT * kHv;        bp  += b * kT * kHv;
-        op  += b * kT * kHv * kD;
+        // kTstride is tokens-per-sequence in the tensors; kT is how many this launch
+        // processes. They differ when the K>1 split runs a prefix, so sequence
+        // offsets must use kTstride and only the loop bounds use kT.
+        qp  += b * kTstride * kHk * kD;   kp  += b * kTstride * kHk * kD;
+        vp  += b * kTstride * v_tok_stride;
+        gp  += b * kTstride * kHv;        bp  += b * kTstride * kHv;
+        op  += b * kTstride * kHv * kD;
         s0p += b * kHv * kD * kD;   stp += b * kHv * kD * kD;
     }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -621,15 +624,14 @@ void ggml_cuda_op_gated_delta_net_chunked_fused(ggml_backend_cuda_context & ctx,
         state_out = bulk_state_out;
     }
 
-    // The kernel derives its per-sequence offsets from T, so a shortened bulk run is
-    // only correct while there is a single sequence. The split router enforces that.
-    GGML_ASSERT(n_bulk <= 0 || B == 1);
+    // Sequence offsets use T_all (tokens per sequence in the tensors) while the loop
+    // bounds use T, so a shortened bulk run is correct for any number of sequences.
 
     const int DTiles = V_dim / DV_TILE;   // dv slabs per head -> grid = H * DTiles blocks
     cudaStream_t stream = ctx.stream();
 
     // Sequences are independent: blockIdx.y = sequence, the kernel offsets its own pointers.
     gdn_fused<<<dim3(H * DTiles, B), dim3(NTHREADS), 0, stream>>>(
-        T, Hk, H, K_dim, q_in, k_in, v_in, g_in, b_in, out, s_in, state_out, v_tok_stride);
+        T, T_all, Hk, H, K_dim, q_in, k_in, v_in, g_in, b_in, out, s_in, state_out, v_tok_stride);
     CUDA_CHECK(cudaGetLastError());
 }
